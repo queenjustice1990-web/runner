@@ -1090,5 +1090,576 @@ namespace GitHub.Runner.Common.Tests.Worker
                 await _debugger.StopAsync();
             }
         }
+
+        // ---------------------------------------------------------------------
+        // Phase 2c: synthesized execution view as DAP source.
+        // ---------------------------------------------------------------------
+
+        private static Mock<GitHub.Runner.Worker.IActionRunner> NewActionRunner(
+            GitHub.Runner.Worker.ActionRunStage stage,
+            string displayName,
+            string actionName = "actions/checkout",
+            string actionRef = "v4")
+        {
+            var mock = new Mock<GitHub.Runner.Worker.IActionRunner>();
+            mock.SetupGet(x => x.Stage).Returns(stage);
+            mock.SetupGet(x => x.DisplayName).Returns(displayName);
+            mock.SetupGet(x => x.Action).Returns(new GitHub.DistributedTask.Pipelines.ActionStep
+            {
+                Reference = new GitHub.DistributedTask.Pipelines.RepositoryPathReference
+                {
+                    Name = actionName,
+                    Ref = actionRef,
+                },
+            });
+            return mock;
+        }
+
+        private async Task DriveDebuggerToReadyAsync(int port)
+        {
+            var waitTask = _debugger.WaitUntilReadyAsync();
+            var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, port);
+            var stream = client.GetStream();
+            await SendRequestAsync(stream, new Request
+            {
+                Seq = 1,
+                Type = "request",
+                Command = "configurationDone",
+            });
+            await waitTask;
+            // Hold the client alive via GC root in caller scope through field.
+            _liveDriveClient = client;
+        }
+
+        private TcpClient _liveDriveClient;
+
+        private static Request MakeRequest(string command, object args = null)
+        {
+            return new Request
+            {
+                Seq = 1,
+                Type = "request",
+                Command = command,
+                Arguments = args == null ? null : Newtonsoft.Json.Linq.JObject.FromObject(args),
+            };
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleSource_ReturnsExecutionViewYaml()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    var step = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Run").Object;
+                    await _debugger.OnJobStepsInitializedAsync(new[] { step }, Array.Empty<IStep>());
+
+                    var response = _debugger.HandleSource(MakeRequest("source", new SourceArguments { SourceReference = 1 }));
+                    Assert.True(response.Success);
+                    var body = Assert.IsType<SourceResponseBody>(response.Body);
+                    Assert.Equal(_debugger.ExecutionView.Yaml, body.Content);
+                    Assert.Null(body.MimeType);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleSource_UnknownReference_Fails()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    var step = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Run").Object;
+                    await _debugger.OnJobStepsInitializedAsync(new[] { step }, Array.Empty<IStep>());
+
+                    var response = _debugger.HandleSource(MakeRequest("source", new SourceArguments { SourceReference = 999 }));
+                    Assert.False(response.Success);
+                    Assert.Contains("Unknown source reference", response.Message);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleSource_NoView_Fails()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    // No OnJobStepsInitializedAsync call — view is null.
+                    var response = _debugger.HandleSource(MakeRequest("source", new SourceArguments { SourceReference = 1 }));
+                    Assert.False(response.Success);
+                    Assert.Contains("Execution view not yet available", response.Message);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleSource_OmitsMimeType()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    var step = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Run").Object;
+                    await _debugger.OnJobStepsInitializedAsync(new[] { step }, Array.Empty<IStep>());
+
+                    var response = _debugger.HandleSource(MakeRequest("source", new SourceArguments { SourceReference = 1 }));
+                    Assert.True(response.Success);
+                    var body = Assert.IsType<SourceResponseBody>(response.Body);
+                    // MimeType is intentionally omitted so DAP clients fall through
+                    // to path-extension detection (`.yml`) — the most consistently
+                    // honored mechanism across VS Code, nvim-dap, and JetBrains.
+                    Assert.Null(body.MimeType);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleSource_MasksSecrets()
+        {
+            const string Secret = "supersecret-shhh-value";
+            using (var hc = CreateTestContext())
+            {
+                hc.SecretMasker.AddValue(Secret);
+
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    // Embed the secret in a step display name so it ends up in the rendered YAML.
+                    var step = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, $"Run {Secret} step").Object;
+                    await _debugger.OnJobStepsInitializedAsync(new[] { step }, Array.Empty<IStep>());
+
+                    // Sanity-check the raw view actually contains the secret;
+                    // otherwise the masking assertion below would pass vacuously.
+                    Assert.Contains(Secret, _debugger.ExecutionView.Yaml);
+
+                    var response = _debugger.HandleSource(MakeRequest("source", new SourceArguments { SourceReference = 1 }));
+                    Assert.True(response.Success);
+                    var body = Assert.IsType<SourceResponseBody>(response.Body);
+                    Assert.DoesNotContain(Secret, body.Content);
+                    Assert.Contains("***", body.Content);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleStackTrace_MasksSecretsInSourcePath()
+        {
+            const string Secret = "secret-job-name-xyz";
+            using (var hc = CreateTestContext())
+            {
+                hc.SecretMasker.AddValue(Secret);
+
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                // Job name (== GitHub context "job") embeds the secret.
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, Secret);
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    var step = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Run").Object;
+                    await _debugger.OnJobStepsInitializedAsync(new[] { step }, Array.Empty<IStep>());
+
+                    _ = _debugger.OnStepStartingAsync(step, isFirstStep: false);
+                    await Task.Delay(50);
+
+                    var response = _debugger.HandleStackTrace(MakeRequest("stackTrace"));
+                    var body = Assert.IsType<StackTraceResponseBody>(response.Body);
+                    Assert.NotEmpty(body.StackFrames);
+                    foreach (var frame in body.StackFrames)
+                    {
+                        if (frame.Source != null)
+                        {
+                            Assert.DoesNotContain(Secret, frame.Source.Path ?? string.Empty);
+                            Assert.DoesNotContain(Secret, frame.Source.Name ?? string.Empty);
+                            Assert.Contains("***", frame.Source.Path ?? string.Empty);
+                        }
+                        Assert.DoesNotContain(Secret, frame.Name ?? string.Empty);
+                    }
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleStackTrace_TwoFramesWhenStepping()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    var step1 = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Step One").Object;
+                    var step2 = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Step Two", "actions/setup-node", "v3").Object;
+                    await _debugger.OnJobStepsInitializedAsync(new[] { step1, step2 }, Array.Empty<IStep>());
+
+                    // Fire-and-forget: first step pauses, but we just want _currentStep set.
+                    _ = _debugger.OnStepStartingAsync(step1, isFirstStep: false);
+                    await Task.Delay(50);
+
+                    var response = _debugger.HandleStackTrace(MakeRequest("stackTrace"));
+                    var body = Assert.IsType<StackTraceResponseBody>(response.Body);
+                    Assert.Equal(2, body.StackFrames.Count);
+
+                    var frame0 = body.StackFrames[0];
+                    Assert.Equal(1, frame0.Source.SourceReference);
+                    Assert.Equal(_debugger.ExecutionView.TryGetLineForStep(step1), frame0.Line);
+                    Assert.Equal("normal", frame0.PresentationHint);
+
+                    var frame1 = body.StackFrames[1];
+                    Assert.Equal(1, frame1.Line);
+                    Assert.Equal("subtle", frame1.PresentationHint);
+                    Assert.Equal(1, frame1.Source.SourceReference);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleStackTrace_OneFrameWhenViewMissing()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    var step = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Lonely").Object;
+                    // No view built — but pause the step so _currentStep is set.
+                    _ = _debugger.OnStepStartingAsync(step, isFirstStep: false);
+                    await Task.Delay(50);
+
+                    var response = _debugger.HandleStackTrace(MakeRequest("stackTrace"));
+                    var body = Assert.IsType<StackTraceResponseBody>(response.Body);
+                    Assert.Single(body.StackFrames);
+                    Assert.Null(body.StackFrames[0].Source);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleStackTrace_NoFramesWhenIdle()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    var response = _debugger.HandleStackTrace(MakeRequest("stackTrace"));
+                    var body = Assert.IsType<StackTraceResponseBody>(response.Body);
+                    Assert.Empty(body.StackFrames);
+                    Assert.Equal(0, body.TotalFrames);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleLoadedSources_ReturnsExecutionView()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    var step = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Run").Object;
+                    await _debugger.OnJobStepsInitializedAsync(new[] { step }, Array.Empty<IStep>());
+
+                    var response = _debugger.HandleLoadedSources(MakeRequest("loadedSources"));
+                    Assert.True(response.Success);
+                    var body = Assert.IsType<LoadedSourcesResponseBody>(response.Body);
+                    Assert.Single(body.Sources);
+                    Assert.Equal("execution.yml", body.Sources[0].Name);
+                    Assert.Equal("ci-job/execution.yml", body.Sources[0].Path);
+                    Assert.Equal(1, body.Sources[0].SourceReference);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleLoadedSources_NoView_ReturnsEmpty()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    var response = _debugger.HandleLoadedSources(MakeRequest("loadedSources"));
+                    Assert.True(response.Success);
+                    var body = Assert.IsType<LoadedSourcesResponseBody>(response.Body);
+                    Assert.Empty(body.Sources);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task HandleSetBreakpoints_ReturnsUnverifiedPlaceholders()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    var step = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Run").Object;
+                    await _debugger.OnJobStepsInitializedAsync(new[] { step }, Array.Empty<IStep>());
+
+                    var args = new SetBreakpointsArguments
+                    {
+                        Source = new Source { SourceReference = 1 },
+                        Breakpoints = new System.Collections.Generic.List<SourceBreakpoint>
+                        {
+                            new SourceBreakpoint { Line = 5 },
+                            new SourceBreakpoint { Line = 10 },
+                            new SourceBreakpoint { Line = 15 },
+                        },
+                    };
+
+                    var response = _debugger.HandleSetBreakpoints(MakeRequest("setBreakpoints", args));
+                    Assert.True(response.Success);
+                    var body = Assert.IsType<SetBreakpointsResponseBody>(response.Body);
+                    Assert.Equal(3, body.Breakpoints.Count);
+                    Assert.All(body.Breakpoints, bp => Assert.False(bp.Verified));
+                    Assert.Equal(new[] { 5, 10, 15 }, body.Breakpoints.ConvertAll(b => b.Line ?? -1));
+                    Assert.All(body.Breakpoints, bp => Assert.False(string.IsNullOrEmpty(bp.Message)));
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task OnJobStepsInitialized_EmitsLoadedSourceNewEvent()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                using var client = await ConnectClientAsync(port);
+                try
+                {
+                    var stream = client.GetStream();
+                    await SendRequestAsync(stream, new Request { Seq = 1, Type = "request", Command = "configurationDone" });
+                    await ReadDapMessageAsync(stream, TimeSpan.FromSeconds(5)); // configurationDone response
+                    await ReadDapMessageAsync(stream, TimeSpan.FromSeconds(5)); // welcome output event
+                    await _debugger.WaitUntilReadyAsync();
+
+                    var step = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Run").Object;
+                    await _debugger.OnJobStepsInitializedAsync(new[] { step }, Array.Empty<IStep>());
+
+                    var msg = await ReadDapMessageAsync(stream, TimeSpan.FromSeconds(5));
+                    Assert.Contains("\"event\":\"loadedSource\"", msg);
+                    Assert.Contains("\"reason\":\"new\"", msg);
+                    Assert.Contains("\"sourceReference\":1", msg);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task OnPostStepRegistered_EmitsLoadedSourceChangedEvent()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                using var client = await ConnectClientAsync(port);
+                try
+                {
+                    var stream = client.GetStream();
+                    await SendRequestAsync(stream, new Request { Seq = 1, Type = "request", Command = "configurationDone" });
+                    await ReadDapMessageAsync(stream, TimeSpan.FromSeconds(5)); // configurationDone response
+                    await ReadDapMessageAsync(stream, TimeSpan.FromSeconds(5)); // welcome output event
+                    await _debugger.WaitUntilReadyAsync();
+
+                    var main = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Run").Object;
+                    await _debugger.OnJobStepsInitializedAsync(new[] { main }, Array.Empty<IStep>());
+                    // Drain the "new" loadedSource event.
+                    await ReadDapMessageAsync(stream, TimeSpan.FromSeconds(5));
+
+                    var post = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Post, "Post Run", "actions/cache", "v3").Object;
+                    _debugger.OnPostStepRegistered(post);
+
+                    var msg = await ReadDapMessageAsync(stream, TimeSpan.FromSeconds(5));
+                    Assert.Contains("\"event\":\"loadedSource\"", msg);
+                    Assert.Contains("\"reason\":\"changed\"", msg);
+                    Assert.Contains("\"sourceReference\":1", msg);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task StackTrace_LineUpdatesAsStepsAdvance()
+        {
+            using (CreateTestContext())
+            {
+                var port = GetFreePort();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var jobContext = CreateJobContextWithTunnel(cts.Token, port, "ci-job");
+                await _debugger.StartAsync(jobContext.Object);
+                try
+                {
+                    await DriveDebuggerToReadyAsync(port);
+                    var s1 = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Step 1", "a/b", "v1").Object;
+                    var s2 = NewActionRunner(GitHub.Runner.Worker.ActionRunStage.Main, "Step 2", "c/d", "v2").Object;
+                    await _debugger.OnJobStepsInitializedAsync(new[] { s1, s2 }, Array.Empty<IStep>());
+
+                    _ = _debugger.OnStepStartingAsync(s1, isFirstStep: true);
+                    await Task.Delay(50);
+
+                    var first = _debugger.HandleStackTrace(MakeRequest("stackTrace"));
+                    var firstBody = Assert.IsType<StackTraceResponseBody>(first.Body);
+                    int firstLine = firstBody.StackFrames[0].Line;
+                    Assert.Equal(_debugger.ExecutionView.TryGetLineForStep(s1), firstLine);
+
+                    _ = _debugger.OnStepStartingAsync(s2, isFirstStep: false);
+                    await Task.Delay(50);
+
+                    var second = _debugger.HandleStackTrace(MakeRequest("stackTrace"));
+                    var secondBody = Assert.IsType<StackTraceResponseBody>(second.Body);
+                    int secondLine = secondBody.StackFrames[0].Line;
+                    Assert.Equal(_debugger.ExecutionView.TryGetLineForStep(s2), secondLine);
+                    Assert.NotEqual(firstLine, secondLine);
+                }
+                finally
+                {
+                    await _debugger.StopAsync();
+                }
+            }
+        }
     }
 }

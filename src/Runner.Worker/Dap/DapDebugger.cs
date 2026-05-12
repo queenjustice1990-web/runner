@@ -16,19 +16,10 @@ using Microsoft.DevTunnels.Connections;
 using Microsoft.DevTunnels.Contracts;
 using Microsoft.DevTunnels.Management;
 using Newtonsoft.Json;
+using Pipelines = GitHub.DistributedTask.Pipelines;
 
 namespace GitHub.Runner.Worker.Dap
 {
-    /// <summary>
-    /// Stores information about a completed step for stack trace display.
-    /// </summary>
-    internal sealed class CompletedStepInfo
-    {
-        public string DisplayName { get; set; }
-        public TaskResult? Result { get; set; }
-        public int FrameId { get; set; }
-    }
-
     /// <summary>
     /// Single public facade for the Debug Adapter Protocol subsystem.
     /// Owns the full transport, handshake, step-level pauses, variable
@@ -51,8 +42,12 @@ namespace GitHub.Runner.Worker.Dap
         // Frame ID for the current step (always 1)
         private const int _currentFrameId = 1;
 
-        // Frame IDs for completed steps start at 1000
-        private const int _completedFrameIdBase = 1000;
+        // Frame ID for the static "job" frame anchored at line 1 of the execution view.
+        private const int _jobFrameId = 2;
+
+        // MVP serves a single synthesized source per session (the job's execution view).
+        // Stable session-scoped ID 1; future sources (composite step-in) will use higher IDs.
+        private const int _executionViewSourceReference = 1;
 
         private TcpListener _listener;
         private TcpClient _client;
@@ -93,11 +88,6 @@ namespace GitHub.Runner.Worker.Dap
         // Current execution context
         private IStep _currentStep;
         private IExecutionContext _jobContext;
-        private int _currentStepIndex;
-
-        // Track completed steps for stack trace
-        private readonly List<CompletedStepInfo> _completedSteps = new List<CompletedStepInfo>();
-        private int _nextCompletedFrameId = _completedFrameIdBase;
 
         // Client connection tracking for reconnection support
         private volatile bool _isClientConnected;
@@ -107,6 +97,8 @@ namespace GitHub.Runner.Worker.Dap
 
         // REPL command executor for run() commands
         private DapReplExecutor _replExecutor;
+
+        private JobExecutionView _executionView;
 
         public bool IsActive =>
             _state == DapSessionState.Ready ||
@@ -260,7 +252,8 @@ namespace GitHub.Runner.Worker.Dap
                     }
                     catch (Exception ex)
                     {
-                        Trace.Warning($"DAP job-completed pause error: {ex.Message}");
+                        Trace.Warning("DAP job-completed pause error.");
+                        Trace.Error(ex);
                     }
                 }
 
@@ -270,7 +263,8 @@ namespace GitHub.Runner.Worker.Dap
                 }
                 catch (Exception ex)
                 {
-                    Trace.Warning($"DAP OnJobCompleted error: {ex.Message}");
+                    Trace.Warning("DAP OnJobCompleted error.");
+                    Trace.Error(ex);
                 }
             }
         }
@@ -387,7 +381,8 @@ namespace GitHub.Runner.Worker.Dap
             }
             catch (Exception ex)
             {
-                Trace.Warning($"DAP OnStepStarting error: {ex.Message}");
+                Trace.Warning("DAP OnStepStarting error.");
+                Trace.Error(ex);
             }
         }
 
@@ -400,10 +395,8 @@ namespace GitHub.Runner.Worker.Dap
 
             try
             {
-                var result = step.ExecutionContext?.Result;
                 Trace.Info("Step completed");
-
-                // Add to completed steps list for stack trace
+                JobExecutionView view;
                 lock (_stateLock)
                 {
                     if (_state != DapSessionState.Ready &&
@@ -413,19 +406,352 @@ namespace GitHub.Runner.Worker.Dap
                         return;
                     }
 
-                    _completedSteps.Add(new CompletedStepInfo
+                    // Clear current-step ref if it matches; otherwise leave alone
+                    // (defensive — OnStepStartingAsync may have already advanced it).
+                    if (ReferenceEquals(_currentStep, step))
                     {
-                        DisplayName = step.DisplayName,
-                        Result = result,
-                        FrameId = _nextCompletedFrameId++
-                    });
+                        _currentStep = null;
+                    }
+                    view = _executionView;
+                }
+
+                // If the skipped step was a Main IActionRunner with a predicted
+                // Post-step placeholder, mark that placeholder as skipped so
+                // the view does not advertise a step that will never run.
+                if (view != null &&
+                    step is IActionRunner actionRunner &&
+                    actionRunner.Stage == ActionRunStage.Main &&
+                    actionRunner.Action != null &&
+                    step.ExecutionContext?.Result == TaskResult.Skipped)
+                {
+                    var matchKey = MatchKeyFor(actionRunner.Action.Id);
+                    if (view.TryMarkSkipped(matchKey))
+                    {
+                        SendLoadedSourceEvent("changed");
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Trace.Warning($"DAP OnStepCompleted error: {ex.Message}");
+                Trace.Warning("DAP OnStepCompleted error.");
+                Trace.Error(ex);
             }
         }
+
+        /// <summary>
+        /// Snapshot of the current job execution view, or null if it has not
+        /// been built yet (debugger inactive, or InitializeJob has not yet
+        /// signalled). Phase 2c will consume this for DAP source/stack-trace
+        /// responses.
+        /// </summary>
+        internal JobExecutionView ExecutionView
+        {
+            get
+            {
+                lock (_stateLock)
+                {
+                    return _executionView;
+                }
+            }
+        }
+
+        public async Task OnJobStepsInitializedAsync(IEnumerable<IStep> mainQueue, IEnumerable<IStep> initialPostStack)
+        {
+            if (!IsActive)
+            {
+                return;
+            }
+
+            try
+            {
+                IExecutionContext jobContext;
+                lock (_stateLock)
+                {
+                    jobContext = _jobContext;
+                }
+
+                string jobId = jobContext?.GetGitHubContext("job");
+                if (string.IsNullOrWhiteSpace(jobId))
+                {
+                    jobId = "job";
+                }
+
+                // Materialize mainQueue once so we can iterate it twice
+                // (once for entries, once for the post-step predictor).
+                var mainSteps = mainQueue == null ? new List<IStep>() : new List<IStep>(mainQueue);
+
+                var entries = new List<(JobExecutionViewEntry entry, IStep stepIdentity)>();
+                foreach (var step in mainSteps)
+                {
+                    var entry = StepEntryTranslator.TryTranslate(step);
+                    if (entry != null)
+                    {
+                        entries.Add((entry, step));
+                    }
+                }
+                // Stack<T>.GetEnumerator() yields items in LIFO order — the
+                // same order callers will pop them. We materialize them into
+                // the view in that pop order so post-step entries appear in
+                // execution order.
+                if (initialPostStack != null)
+                {
+                    foreach (var step in initialPostStack)
+                    {
+                        var entry = StepEntryTranslator.TryTranslate(step);
+                        if (entry != null)
+                        {
+                            entries.Add((entry, step));
+                        }
+                    }
+                }
+
+                var view = new JobExecutionView(jobId);
+                if (entries.Count > 0)
+                {
+                    view.AppendRange(entries);
+                }
+
+                // Predict Post-step placeholders for actions that declare
+                // HasPost in their action manifest. Walking Pre+Main runners
+                // in declaration order, then prepending each prediction so
+                // the rendered post section matches the runner's LIFO
+                // post-execution order (the runner's post stack pops in
+                // reverse-registration order). Wrapped in a try/catch so a
+                // missing IActionManager or LoadAction failure cannot
+                // prevent the view from being published.
+                try
+                {
+                    PredictPostPlaceholders(jobContext, mainSteps, view);
+                }
+                catch (Exception ex)
+                {
+                    Trace.Warning("DAP predictor: predicting post placeholders failed; continuing without predictions.");
+                    Trace.Error(ex);
+                }
+
+                lock (_stateLock)
+                {
+                    _executionView = view;
+                }
+
+                Trace.Info($"DAP execution view initialized with {view.EntryCount} entries.");
+                SendLoadedSourceEvent("new");
+            }
+            catch (Exception ex)
+            {
+                Trace.Warning("DAP OnJobStepsInitialized error.");
+                Trace.Error(ex);
+            }
+
+            await Task.CompletedTask;
+        }
+
+        public void OnPostStepRegistered(IStep step)
+        {
+            if (!IsActive || step == null)
+            {
+                return;
+            }
+
+            try
+            {
+                JobExecutionView view;
+                lock (_stateLock)
+                {
+                    view = _executionView;
+                }
+
+                if (view == null)
+                {
+                    return;
+                }
+
+                // Try to claim a previously-predicted placeholder. When
+                // OnJobStepsInitializedAsync ran, we walked the Pre+Main
+                // queue and synthesized a Post placeholder for every action
+                // whose manifest declared HasPost. If this registration
+                // matches one of those placeholders by Action.Id, claim it
+                // in place — no view growth, no `loadedSource changed`
+                // event needed.
+                if (step is IActionRunner postRunner && postRunner.Action != null)
+                {
+                    var matchKey = MatchKeyFor(postRunner.Action.Id);
+                    if (view.TryClaim(matchKey, step).HasValue)
+                    {
+                        return;
+                    }
+                }
+
+                // Unpredicted path: composite-action JIT post discovery,
+                // container hooks, or any other registration we did not
+                // foresee at view-build time. Fall back to append + notify
+                // clients via `loadedSource changed`.
+                var entry = StepEntryTranslator.TryTranslate(step);
+                if (entry == null)
+                {
+                    return;
+                }
+
+                try
+                {
+                    view.Append(entry, step);
+                    SendLoadedSourceEvent("changed");
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // Step already registered — RegisterPostJobStep tolerates
+                    // duplicate registrations in some workflow shapes; mirror
+                    // that semantics here so we don't propagate.
+                    Trace.Info($"DAP OnPostStepRegistered: duplicate step ignored ({ex.Message}).");
+                }
+            }
+            catch (Exception ex)
+            {
+                Trace.Warning("DAP OnPostStepRegistered error.");
+                Trace.Error(ex);
+            }
+        }
+
+        /// <summary>
+        /// Walks <paramref name="mainSteps"/> (the queue of Pre+Main
+        /// IActionRunners produced by JobRunner) and synthesizes a Post
+        /// placeholder entry on <paramref name="view"/> for every action
+        /// whose manifest declares <c>HasPost = true</c>.
+        ///
+        /// Conditions mirror <c>ActionRunner.RunAsync</c> exactly:
+        /// the runner is in Pre or Main stage, the action is a
+        /// <see cref="Pipelines.RepositoryPathReference"/> that is NOT the
+        /// self-repository alias, the action is not a script, and the
+        /// resolved <see cref="Definition"/> reports HasPost.
+        ///
+        /// Predictions are collected in declaration order, then APPENDED
+        /// in reverse so the rendered post section mirrors the runner's
+        /// LIFO post-execution order (the runner's post stack pops in
+        /// reverse-registration order — see ExecutionContext.RegisterPostJobStep).
+        /// </summary>
+        private void PredictPostPlaceholders(IExecutionContext jobContext, IReadOnlyList<IStep> mainSteps, JobExecutionView view)
+        {
+            if (jobContext == null || mainSteps == null || mainSteps.Count == 0 || view == null)
+            {
+                return;
+            }
+
+            IActionManager actionManager;
+            try
+            {
+                actionManager = HostContext.GetService<IActionManager>();
+            }
+            catch (Exception ex)
+            {
+                Trace.Info($"DAP predictor: IActionManager unavailable ({ex.Message}); skipping post-step prediction.");
+                return;
+            }
+
+            var predictions = new List<(JobExecutionViewEntry entry, string matchKey)>();
+            var seenActionIds = new HashSet<Guid>();
+
+            foreach (var step in mainSteps)
+            {
+                if (step is not IActionRunner runner)
+                {
+                    continue;
+                }
+                if (runner.Stage == ActionRunStage.Post)
+                {
+                    // Post entries are already seeded from initialPostStack.
+                    continue;
+                }
+                var action = runner.Action;
+                if (action == null)
+                {
+                    continue;
+                }
+                // ActionRunner.cs:113 — Post only created when the action is
+                // a RepositoryPathReference that is not the self-repository
+                // alias and not a script.
+                if (action.Reference is not Pipelines.RepositoryPathReference repoRef)
+                {
+                    continue;
+                }
+                if (string.Equals(repoRef.RepositoryType, Pipelines.PipelineConstants.SelfAlias, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                // (A RepositoryPathReference is never a script — script
+                // run-steps surface as a different ActionStepDefinitionReference
+                // subclass, so the cast above already filtered them out.)
+                // Dedupe by Action.Id: the runtime dedups via
+                // Root.StepsWithPostRegistered.Add(actionRunner.Action.Id),
+                // so two steps referencing the same Action.Id only ever
+                // register one Post. Mirror that here so we don't synthesize
+                // two placeholders for one future registration.
+                if (!seenActionIds.Add(action.Id))
+                {
+                    continue;
+                }
+
+                Definition definition;
+                try
+                {
+                    definition = actionManager.LoadAction(jobContext, action);
+                }
+                catch (Exception ex)
+                {
+                    Trace.Info($"DAP predictor: LoadAction failed for {repoRef.Name} ({ex.Message}); skipping prediction.");
+                    continue;
+                }
+
+                if (definition?.Data?.Execution?.HasPost != true)
+                {
+                    continue;
+                }
+
+                // Compute the Post display name exactly as ActionRunner does
+                // when it constructs the Post IActionRunner (ActionRunner.cs:115-122).
+                var displayName = runner.DisplayName;
+                if (string.IsNullOrEmpty(displayName))
+                {
+                    displayName = "step";
+                }
+                if (runner.Stage == ActionRunStage.Pre &&
+                    displayName.StartsWith("Pre ", StringComparison.OrdinalIgnoreCase))
+                {
+                    displayName = displayName.Substring("Pre ".Length);
+                }
+                var postDisplayName = $"Post {displayName}";
+
+                var entry = new JobExecutionViewEntry(
+                    phase: JobExecutionPhase.Post,
+                    displayName: postDisplayName,
+                    uses: StepEntryTranslator.FormatActionReference(action.Reference));
+
+                predictions.Add((entry, MatchKeyFor(action.Id)));
+            }
+
+            // Reverse declaration order so the rendered post section
+            // matches the LIFO order in which the runner will pop posts.
+            predictions.Reverse();
+
+            foreach (var (entry, key) in predictions)
+            {
+                try
+                {
+                    view.Append(entry, stepIdentity: null, matchKey: key);
+                }
+                catch (Exception ex)
+                {
+                    Trace.Warning("DAP predictor: failed to append Post placeholder; skipping.");
+                    Trace.Error(ex);
+                }
+            }
+        }
+
+        // Stable, opaque key derived from an action's Pipelines.ActionStep.Id.
+        // All IActionRunner instances for the same action (Pre/Main/Post)
+        // share the same Action reference (see ActionRunner.cs:131), so the
+        // Id is constant across phases and is the right join key.
+        private static string MatchKeyFor(Guid actionId) =>
+            $"post:{actionId:N}";
 
         internal async Task HandleMessageAsync(string messageJson, CancellationToken cancellationToken)
         {
@@ -468,6 +794,8 @@ namespace GitHub.Runner.Worker.Dap
                         "next" => HandleNext(request),
                         "setBreakpoints" => HandleSetBreakpoints(request),
                         "setExceptionBreakpoints" => HandleSetExceptionBreakpoints(request),
+                        "source" => HandleSource(request),
+                        "loadedSources" => HandleLoadedSources(request),
                         "completions" => HandleCompletions(request),
                         "stepIn" => CreateResponse(request, false, "Step In is not supported. Actions jobs debug at the step level - use 'next' to advance to the next step.", body: null),
                         "stepOut" => CreateResponse(request, false, "Step Out is not supported. Actions jobs debug at the step level - use 'continue' to resume.", body: null),
@@ -855,7 +1183,7 @@ namespace GitHub.Runner.Worker.Dap
 
         internal async Task OnStepStartingAsync(IStep step, bool isFirstStep)
         {
-            bool pauseOnNextStep;
+            bool shouldPause;
             CancellationToken cancellationToken;
             lock (_stateLock)
             {
@@ -867,17 +1195,13 @@ namespace GitHub.Runner.Worker.Dap
                 }
 
                 _currentStep = step;
-                _currentStepIndex = _completedSteps.Count;
-                pauseOnNextStep = _pauseOnNextStep;
                 cancellationToken = _jobContext?.CancellationToken ?? CancellationToken.None;
+                shouldPause = ShouldPauseBefore(step, isFirstStep);
             }
 
             // Reset variable references so stale nested refs from the
             // previous step are not served to the client.
             _variableProvider?.Reset();
-
-            // Determine if we should pause
-            bool shouldPause = isFirstStep || pauseOnNextStep;
 
             if (!shouldPause)
             {
@@ -900,6 +1224,29 @@ namespace GitHub.Runner.Worker.Dap
 
             // Wait for debugger command
             await WaitForCommandAsync(cancellationToken);
+        }
+
+        /// <summary>
+        /// Decides whether the debugger should pause before <paramref name="step"/>.
+        /// Today: pause on the first step always; otherwise pause when the user
+        /// has elected step-mode (the 'next' command). Future breakpoint support
+        /// will be a single additional check here against a per-step breakpoint set.
+        /// Caller MUST hold <c>_stateLock</c>.
+        /// </summary>
+        private bool ShouldPauseBefore(IStep step, bool isFirstStep)
+        {
+            if (isFirstStep)
+            {
+                return true;
+            }
+
+            if (_pauseOnNextStep)
+            {
+                return true;
+            }
+
+            // TODO Phase 2c+1: if (_breakpointSet.Contains(step)) return true;
+            return false;
         }
 
         internal void OnJobCompleted()
@@ -973,7 +1320,7 @@ namespace GitHub.Runner.Worker.Dap
                 SupportsTerminateRequest = false,
                 SupportTerminateDebuggee = false,
                 SupportsDelayedStackTraceLoading = false,
-                SupportsLoadedSourcesRequest = false,
+                SupportsLoadedSourcesRequest = true,
                 SupportsProgressReporting = false,
                 SupportsRunInTerminalRequest = false,
                 SupportsCancelRequest = false,
@@ -1047,69 +1394,152 @@ namespace GitHub.Runner.Worker.Dap
             return CreateResponse(request, true, body: body);
         }
 
-        private Response HandleStackTrace(Request request)
+        internal Response HandleStackTrace(Request request)
         {
             IStep currentStep;
-            int currentStepIndex;
-            CompletedStepInfo[] completedSteps;
+            JobExecutionView view;
             lock (_stateLock)
             {
                 currentStep = _currentStep;
-                currentStepIndex = _currentStepIndex;
-                completedSteps = _completedSteps.ToArray();
+                view = _executionView;
             }
 
             var frames = new List<StackFrame>();
 
-            // Add current step as the top frame
-            if (currentStep != null)
+            if (view != null)
             {
-                var resultIndicator = currentStep.ExecutionContext?.Result != null
-                    ? $" [{currentStep.ExecutionContext.Result}]"
-                    : " [running]";
+                var source = BuildExecutionViewSource(view.JobId);
 
-                frames.Add(new StackFrame
+                // Frame 0: the currently-executing step (only when one is set).
+                if (currentStep != null)
                 {
-                    Id = _currentFrameId,
-                    Name = MaskUserVisibleText($"{currentStep.DisplayName ?? "Current Step"}{resultIndicator}"),
-                    Line = currentStepIndex + 1,
-                    Column = 1,
-                    PresentationHint = "normal"
-                });
-            }
-            else
-            {
-                frames.Add(new StackFrame
-                {
-                    Id = _currentFrameId,
-                    Name = "(no step executing)",
-                    Line = 0,
-                    Column = 1,
-                    PresentationHint = "subtle"
-                });
-            }
+                    var stepLine = view.TryGetLineForStep(currentStep) ?? 1;
+                    frames.Add(new StackFrame
+                    {
+                        Id = _currentFrameId,
+                        Name = MaskUserVisibleText(currentStep.DisplayName ?? "step"),
+                        Line = stepLine,
+                        Column = 1,
+                        Source = source,
+                        PresentationHint = "normal",
+                    });
+                }
 
-            // Add completed steps as additional frames (most recent first)
-            for (int i = completedSteps.Length - 1; i >= 0; i--)
-            {
-                var completedStep = completedSteps[i];
-                var resultStr = completedStep.Result.HasValue ? $" [{completedStep.Result}]" : "";
+                // Frame 1: the job (anchors the stack; line 1 = the synthesized header).
                 frames.Add(new StackFrame
                 {
-                    Id = completedStep.FrameId,
-                    Name = MaskUserVisibleText($"{completedStep.DisplayName}{resultStr}"),
+                    Id = _jobFrameId,
+                    Name = MaskUserVisibleText($"job: {view.JobId}"),
                     Line = 1,
                     Column = 1,
-                    PresentationHint = "subtle"
+                    Source = source,
+                    PresentationHint = "subtle",
+                });
+            }
+            else if (currentStep != null)
+            {
+                // Defensive: view not yet built but a step is executing.
+                // Still emit a single frame with no Source so the client doesn't choke.
+                frames.Add(new StackFrame
+                {
+                    Id = _currentFrameId,
+                    Name = MaskUserVisibleText(currentStep.DisplayName ?? "step"),
+                    Line = 1,
+                    Column = 1,
+                    PresentationHint = "normal",
                 });
             }
 
             var body = new StackTraceResponseBody
             {
                 StackFrames = frames,
-                TotalFrames = frames.Count
+                TotalFrames = frames.Count,
             };
 
+            return CreateResponse(request, true, body: body);
+        }
+
+        /// <summary>
+        /// Builds the synthesized job execution view <see cref="Source"/> descriptor.
+        /// All frames in a session share one Source; the client retrieves its
+        /// content via the DAP <c>source</c> request keyed by <see cref="_executionViewSourceReference"/>.
+        /// </summary>
+        private Source BuildExecutionViewSource(string jobId)
+        {
+            return new Source
+            {
+                Name = MaskUserVisibleText("execution.yml"),
+                Path = MaskUserVisibleText($"{jobId}/execution.yml"),
+                SourceReference = _executionViewSourceReference,
+                PresentationHint = "normal",
+            };
+        }
+
+        internal Response HandleSource(Request request)
+        {
+            SourceArguments args;
+            try
+            {
+                args = request.Arguments?.ToObject<SourceArguments>();
+            }
+            catch (Exception ex)
+            {
+                Trace.Warning($"Failed to parse source arguments: {ex.GetType().Name}");
+                return CreateResponse(request, false, "Invalid source arguments.", body: null);
+            }
+
+            if (args == null)
+            {
+                return CreateResponse(request, false, "Missing source arguments.", body: null);
+            }
+
+            JobExecutionView view;
+            lock (_stateLock)
+            {
+                view = _executionView;
+            }
+
+            if (view == null)
+            {
+                return CreateResponse(request, false, "Execution view not yet available.", body: null);
+            }
+
+            if (args.SourceReference != _executionViewSourceReference)
+            {
+                return CreateResponse(request, false, $"Unknown source reference: {args.SourceReference}.", body: null);
+            }
+
+            var body = new SourceResponseBody
+            {
+                Content = MaskUserVisibleText(view.Yaml),
+                // MimeType intentionally unset: VS Code's debug content provider
+                // short-circuits language detection on the response's mimeType
+                // (exact-match against its registered language mimetypes) and
+                // falls back to plaintext on unknown values. The IANA YAML type
+                // "application/yaml" is not in VS Code's table (it only knows
+                // the legacy "text/x-yaml" synthesized for the built-in YAML
+                // language contribution). By omitting mimeType, clients fall
+                // through to path-extension detection — `.yml` in Source.Path
+                // is the universal mechanism every DAP client honors
+                // consistently (VS Code, nvim-dap, JetBrains).
+            };
+
+            return CreateResponse(request, true, body: body);
+        }
+
+        internal Response HandleLoadedSources(Request request)
+        {
+            JobExecutionView view;
+            lock (_stateLock)
+            {
+                view = _executionView;
+            }
+
+            var body = new LoadedSourcesResponseBody();
+            if (view != null)
+            {
+                body.Sources.Add(BuildExecutionViewSource(view.JobId));
+            }
             return CreateResponse(request, true, body: body);
         }
 
@@ -1333,11 +1763,40 @@ namespace GitHub.Runner.Worker.Dap
             return CreateResponse(request, true, body: null);
         }
 
-        private Response HandleSetBreakpoints(Request request)
+        internal Response HandleSetBreakpoints(Request request)
         {
-            // MVP: acknowledge but don't process breakpoints
-            // All steps pause automatically via _pauseOnNextStep
-            return CreateResponse(request, true, body: new { breakpoints = Array.Empty<object>() });
+            SetBreakpointsArguments args = null;
+            try
+            {
+                args = request.Arguments?.ToObject<SetBreakpointsArguments>();
+            }
+            catch (Exception ex)
+            {
+                Trace.Warning($"Failed to parse setBreakpoints arguments: {ex.GetType().Name}");
+            }
+
+            JobExecutionView view;
+            lock (_stateLock)
+            {
+                view = _executionView;
+            }
+
+            var body = new SetBreakpointsResponseBody();
+            if (args?.Breakpoints != null && view != null)
+            {
+                var source = BuildExecutionViewSource(view.JobId);
+                foreach (var requested in args.Breakpoints)
+                {
+                    body.Breakpoints.Add(new Breakpoint
+                    {
+                        Verified = false,
+                        Line = requested.Line,
+                        Source = source,
+                        Message = "Breakpoint support is coming in a future runner release. The debugger currently pauses at every step boundary; use 'continue' to advance.",
+                    });
+                }
+            }
+            return CreateResponse(request, true, body: body);
         }
 
         private Response HandleSetExceptionBreakpoints(Request request)
@@ -1402,8 +1861,7 @@ namespace GitHub.Runner.Worker.Dap
 
         /// <summary>
         /// Resolves the execution context for a given stack frame ID.
-        /// Frame 1 = current step; frames 1000+ = completed steps (no
-        /// context available - those steps have already finished).
+        /// Frame 1 = current step; frame 2 = job-level (subtle anchor frame).
         /// Falls back to the job-level context when no step is active.
         /// </summary>
         private IExecutionContext GetExecutionContextForFrame(int frameId)
@@ -1413,7 +1871,7 @@ namespace GitHub.Runner.Worker.Dap
                 return GetCurrentExecutionContext();
             }
 
-            // Completed-step frames don't carry a live execution context.
+            // Job/anchor frame — no step-level context.
             return null;
         }
 
@@ -1482,6 +1940,33 @@ namespace GitHub.Runner.Worker.Dap
             }
 
             SendOutput("console", $"\nCommands will run on {target}\n");
+        }
+
+        /// <summary>
+        /// Sends a loadedSource event with the current execution view's source.
+        /// No-op if the view has not been built yet.
+        /// </summary>
+        private void SendLoadedSourceEvent(string reason)
+        {
+            JobExecutionView view;
+            lock (_stateLock)
+            {
+                view = _executionView;
+            }
+            if (view == null)
+            {
+                return;
+            }
+
+            SendEvent(new Event
+            {
+                EventType = "loadedSource",
+                Body = new LoadedSourceEventBody
+                {
+                    Reason = reason,
+                    Source = BuildExecutionViewSource(view.JobId),
+                },
+            });
         }
 
         private string MaskUserVisibleText(string value)

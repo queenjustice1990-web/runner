@@ -537,6 +537,132 @@ namespace GitHub.Runner.Worker.Dap
 
     #endregion
 
+    #region Source Request/Response
+
+    /// <summary>
+    /// Arguments for 'source' request.
+    /// </summary>
+    public class SourceArguments
+    {
+        /// <summary>
+        /// Source descriptor (optional, redundant with sourceReference).
+        /// </summary>
+        [JsonProperty("source", NullValueHandling = NullValueHandling.Ignore)]
+        public Source Source { get; set; }
+
+        /// <summary>
+        /// The reference to the source. Required by DAP spec.
+        /// </summary>
+        [JsonProperty("sourceReference")]
+        public int SourceReference { get; set; }
+    }
+
+    /// <summary>
+    /// Response body for 'source' request.
+    /// </summary>
+    public class SourceResponseBody
+    {
+        /// <summary>
+        /// Content of the source as a string.
+        /// </summary>
+        [JsonProperty("content")]
+        public string Content { get; set; }
+
+        /// <summary>
+        /// Optional content type / mime type of the source.
+        /// </summary>
+        [JsonProperty("mimeType", NullValueHandling = NullValueHandling.Ignore)]
+        public string MimeType { get; set; }
+    }
+
+    #endregion
+
+    #region LoadedSources Request/Response
+
+    /// <summary>
+    /// Response body for 'loadedSources' request.
+    /// </summary>
+    public class LoadedSourcesResponseBody
+    {
+        [JsonProperty("sources")]
+        public List<Source> Sources { get; set; } = new List<Source>();
+    }
+
+    /// <summary>
+    /// Body for 'loadedSource' event.
+    /// </summary>
+    public class LoadedSourceEventBody
+    {
+        /// <summary>
+        /// "new" | "changed" | "removed"
+        /// </summary>
+        [JsonProperty("reason")]
+        public string Reason { get; set; }
+
+        [JsonProperty("source")]
+        public Source Source { get; set; }
+    }
+
+    #endregion
+
+    #region SetBreakpoints Request/Response
+
+    /// <summary>
+    /// Arguments for 'setBreakpoints' request.
+    /// </summary>
+    public class SetBreakpointsArguments
+    {
+        [JsonProperty("source", NullValueHandling = NullValueHandling.Ignore)]
+        public Source Source { get; set; }
+
+        [JsonProperty("breakpoints")]
+        public List<SourceBreakpoint> Breakpoints { get; set; } = new List<SourceBreakpoint>();
+    }
+
+    /// <summary>
+    /// Properties of a breakpoint passed to the setBreakpoints request.
+    /// </summary>
+    public class SourceBreakpoint
+    {
+        [JsonProperty("line")]
+        public int Line { get; set; }
+
+        [JsonProperty("condition", NullValueHandling = NullValueHandling.Ignore)]
+        public string Condition { get; set; }
+
+        [JsonProperty("logMessage", NullValueHandling = NullValueHandling.Ignore)]
+        public string LogMessage { get; set; }
+    }
+
+    /// <summary>
+    /// Response body for 'setBreakpoints' request.
+    /// </summary>
+    public class SetBreakpointsResponseBody
+    {
+        [JsonProperty("breakpoints")]
+        public List<Breakpoint> Breakpoints { get; set; } = new List<Breakpoint>();
+    }
+
+    /// <summary>
+    /// Information about a breakpoint created in setBreakpoints.
+    /// </summary>
+    public class Breakpoint
+    {
+        [JsonProperty("verified")]
+        public bool Verified { get; set; }
+
+        [JsonProperty("line", NullValueHandling = NullValueHandling.Ignore)]
+        public int? Line { get; set; }
+
+        [JsonProperty("source", NullValueHandling = NullValueHandling.Ignore)]
+        public Source Source { get; set; }
+
+        [JsonProperty("message", NullValueHandling = NullValueHandling.Ignore)]
+        public string Message { get; set; }
+    }
+
+    #endregion
+
     #region Scopes Request/Response
 
     /// <summary>
