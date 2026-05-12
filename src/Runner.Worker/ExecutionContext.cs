@@ -338,6 +338,14 @@ namespace GitHub.Runner.Worker
 
             step.ExecutionContext = Root.CreatePostChild(step.DisplayName, IntraActionState, siblingScopeName);
             Root.PostJobSteps.Push(step);
+            // Only consult the DAP debugger when it was actually enabled for this job.
+            // Without this guard, HostContext.GetService<IDapDebugger>() would auto-
+            // instantiate the default singleton for every non-debug job, violating the
+            // "no debugger, no risk" containment property.
+            if (Global.Debugger?.Enabled == true)
+            {
+                HostContext.GetService<Dap.IDapDebugger>().OnPostStepRegistered(step);
+            }
         }
 
         public IExecutionContext CreateChild(

@@ -230,6 +230,24 @@ namespace GitHub.Runner.Worker
                         jobContext.JobSteps.Enqueue(step);
                     }
 
+                    if (jobContext.Global.Debugger?.Enabled == true)
+                    {
+                        // Only consult the DAP debugger when it was actually enabled for this job.
+                        // Without this guard, HostContext.GetService<IDapDebugger>() would auto-
+                        // instantiate the default singleton for every non-debug job, violating the
+                        // "no debugger, no risk" containment property.
+                        var dapDebugger = HostContext.GetService<Dap.IDapDebugger>();
+                        try
+                        {
+                            await dapDebugger.OnJobStepsInitializedAsync(jobContext.JobSteps, jobContext.PostJobSteps);
+                        }
+                        catch (Exception ex)
+                        {
+                            Trace.Warning("DAP OnJobStepsInitialized error; continuing without DAP view.");
+                            Trace.Error(ex);
+                        }
+                    }
+
                     await stepsRunner.RunAsync(jobContext);
                 }
                 catch (Exception ex)

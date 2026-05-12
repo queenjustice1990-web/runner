@@ -1,5 +1,6 @@
 ﻿using GitHub.DistributedTask.WebApi;
 using GitHub.Runner.Worker;
+using GitHub.Runner.Worker.Dap;
 using Moq;
 using System;
 using System.Collections.Generic;
@@ -83,6 +84,7 @@ namespace GitHub.Runner.Common.Tests.Worker
             hc.SetSingleton(_extensions.Object);
             hc.SetSingleton(_temp.Object);
             hc.SetSingleton(_diagnosticLogManager.Object);
+            hc.SetSingleton(new Mock<IDapDebugger>().Object);
             hc.EnqueueInstance<IExecutionContext>(_jobEc);
             hc.EnqueueInstance<IPagingLogger>(_logger.Object);
             hc.EnqueueInstance<IJobExtension>(_jobExtension.Object);
@@ -173,6 +175,30 @@ namespace GitHub.Runner.Common.Tests.Worker
                 var message = GetMessage(JobRequestMessageTypes.RunnerJobRequest);
                 await _jobRunner.RunAsync(message, _tokenSource.Token);
                 Assert.Equal(TaskResult.Succeeded, _jobEc.Result);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async Task DebuggerDisabled_DoesNotInvokeDapDebugger()
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                // Override the lenient IDapDebugger singleton from CreateTestContext
+                // with a strict mock. If the containment guard fails, the production
+                // code will call OnJobStepsInitializedAsync and the strict mock will throw.
+                var dapMock = new Mock<IDapDebugger>(MockBehavior.Strict);
+                hc.SetSingleton(dapMock.Object);
+
+                var message = GetMessage();
+                // EnableDebugger defaults to false on AgentJobRequestMessage.
+                Assert.False(message.EnableDebugger);
+
+                await _jobRunner.RunAsync(message, _tokenSource.Token);
+
+                Assert.Equal(TaskResult.Succeeded, _jobEc.Result);
+                dapMock.VerifyNoOtherCalls();
             }
         }
     }

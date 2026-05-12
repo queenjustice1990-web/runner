@@ -7,6 +7,7 @@ using GitHub.DistributedTask.Pipelines.ContextData;
 using GitHub.DistributedTask.WebApi;
 using GitHub.Runner.Worker;
 using GitHub.Runner.Worker.Container;
+using GitHub.Runner.Worker.Dap;
 using GitHub.Runner.Worker.Handlers;
 using Moq;
 using Xunit;
@@ -405,6 +406,7 @@ namespace GitHub.Runner.Common.Tests.Worker
                 hc.EnqueueInstance(pagingLogger5.Object);
                 hc.EnqueueInstance(actionRunner1 as IActionRunner);
                 hc.EnqueueInstance(actionRunner2 as IActionRunner);
+                hc.SetSingleton(new Mock<IDapDebugger>().Object);
                 hc.SetSingleton(jobServerQueue.Object);
 
                 var jobContext = new Runner.Worker.ExecutionContext();
@@ -503,6 +505,7 @@ namespace GitHub.Runner.Common.Tests.Worker
                 hc.EnqueueInstance(pagingLogger5.Object);
                 hc.EnqueueInstance(actionRunner1 as IActionRunner);
                 hc.EnqueueInstance(actionRunner2 as IActionRunner);
+                hc.SetSingleton(new Mock<IDapDebugger>().Object);
                 hc.SetSingleton(jobServerQueue.Object);
 
                 var jobContext = new Runner.Worker.ExecutionContext();
@@ -541,6 +544,75 @@ namespace GitHub.Runner.Common.Tests.Worker
                 Assert.Equal(ActionRunStage.Post, (post1 as IActionRunner).Stage);
 
                 Assert.Equal("always()", (post1 as IActionRunner).Condition);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void RegisterPostJobAction_DebuggerDisabled_DoesNotInvokeDapDebugger()
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                // Arrange: Create a job request message with EnableDebugger left at the default (false).
+                TaskOrchestrationPlanReference plan = new();
+                TimelineReference timeline = new();
+                Guid jobId = Guid.NewGuid();
+                string jobName = "some job name";
+                var jobRequest = new Pipelines.AgentJobRequestMessage(plan, timeline, jobId, jobName, jobName, null, null, null, new Dictionary<string, VariableValue>(), new List<MaskHint>(), new Pipelines.JobResources(), new Pipelines.ContextData.DictionaryContextData(), new Pipelines.WorkspaceOptions(), new List<Pipelines.ActionStep>(), null, null, null, null, null);
+                jobRequest.Resources.Repositories.Add(new Pipelines.RepositoryResource()
+                {
+                    Alias = Pipelines.PipelineConstants.SelfAlias,
+                    Id = "github",
+                    Version = "sha1"
+                });
+                jobRequest.ContextData["github"] = new Pipelines.ContextData.DictionaryContextData();
+
+                var pagingLogger = new Mock<IPagingLogger>();
+                var jobServerQueue = new Mock<IJobServerQueue>();
+                jobServerQueue.Setup(x => x.QueueTimelineRecordUpdate(It.IsAny<Guid>(), It.IsAny<TimelineRecord>()));
+                jobServerQueue.Setup(x => x.QueueWebConsoleLine(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<long?>()));
+
+                var actionRunner = new ActionRunner();
+                actionRunner.Initialize(hc);
+
+                hc.EnqueueInstance(pagingLogger.Object);
+                hc.EnqueueInstance(pagingLogger.Object);
+                hc.EnqueueInstance(pagingLogger.Object);
+                hc.EnqueueInstance(pagingLogger.Object);
+                hc.EnqueueInstance(pagingLogger.Object);
+                hc.EnqueueInstance(pagingLogger.Object);
+                hc.EnqueueInstance(pagingLogger.Object);
+                hc.EnqueueInstance(actionRunner as IActionRunner);
+
+                // Register a strict mock IDapDebugger. If the production code calls
+                // ANY method on it, the test fails — proving the containment guard
+                // short-circuited before HostContext.GetService<IDapDebugger>().
+                var dapMock = new Mock<IDapDebugger>(MockBehavior.Strict);
+                hc.SetSingleton(dapMock.Object);
+                hc.SetSingleton(jobServerQueue.Object);
+
+                var jobContext = new Runner.Worker.ExecutionContext();
+                jobContext.Initialize(hc);
+                jobContext.InitializeJob(jobRequest, CancellationToken.None);
+
+                var action = jobContext.CreateChild(Guid.NewGuid(), "action_1", "action_1", null, null, 0);
+
+                var postRunner = hc.CreateService<IActionRunner>();
+                postRunner.Action = new Pipelines.ActionStep() { Id = Guid.NewGuid(), Name = "post", DisplayName = "Post", Reference = new Pipelines.RepositoryPathReference() { Name = "actions/action" } };
+                postRunner.Stage = ActionRunStage.Post;
+                postRunner.Condition = "always()";
+                postRunner.DisplayName = "post";
+
+                // Sanity: ensure the production code path actually believes the debugger is disabled.
+                Assert.True(jobContext.Global.Debugger == null || jobContext.Global.Debugger.Enabled == false);
+
+                // Act.
+                action.RegisterPostJobStep(postRunner);
+
+                // Assert: the debugger was never consulted on the non-debug path.
+                dapMock.VerifyNoOtherCalls();
+                Assert.Equal(1, jobContext.PostJobSteps.Count);
             }
         }
 

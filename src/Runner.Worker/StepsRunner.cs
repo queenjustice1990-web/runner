@@ -219,12 +219,18 @@ namespace GitHub.Runner.Worker
                             // Condition is false
                             Trace.Info("Skipping step due to condition evaluation.");
                             CompleteStep(step, TaskResult.Skipped, resultCode: conditionTraceWriter.Trace);
+                            // Notify the DAP debugger so any predicted Post-step
+                            // placeholder for this Main step can be marked as
+                            // skipped — otherwise the rendered view leaves a
+                            // stale "Post X" entry for a step that never ran.
+                            dapDebugger?.OnStepCompleted(step);
                         }
                         else if (conditionEvaluateError != null)
                         {
                             // Condition error
                             step.ExecutionContext.Error(conditionEvaluateError);
                             CompleteStep(step, TaskResult.Failed);
+                            dapDebugger?.OnStepCompleted(step);
                         }
                         else
                         {
