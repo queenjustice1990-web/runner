@@ -97,7 +97,9 @@ namespace GitHub.Runner.Worker.Dap
             using var sw = new StringWriter(CultureInfo.InvariantCulture);
             var emitter = new Emitter(sw);
             var adapter = new TemplateTokenYamlAdapter(emitter);
-            TemplateWriter.Write(adapter, token);
+            adapter.WriteStart();
+            WriteToken(adapter, token);
+            adapter.WriteEnd();
 
             string raw = sw.ToString();
             // Strip YAML document markers ("--- " prefix and "\n..." suffix).
@@ -143,6 +145,65 @@ namespace GitHub.Runner.Worker.Dap
                 i = end + 1;
             }
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// Mirrors <see cref="TemplateWriter"/>'s recursive walk, with one
+        /// behavioural change: <see cref="BasicExpressionToken"/> is emitted
+        /// via <c>ToDisplayString()</c> instead of <c>ToString()</c>.
+        /// </summary>
+        /// <remarks>
+        /// The workflow parser tokenizes a mixed scalar like
+        /// <c>${{ runner.os }}-primes</c> as a single
+        /// <see cref="BasicExpressionToken"/> whose internal expression is
+        /// <c>format('{0}-primes', runner.os)</c>. <c>ToString()</c> emits
+        /// the normalized form verbatim; <c>ToDisplayString()</c> reverses
+        /// the <c>format(...)</c> rewrite so the user sees the original
+        /// authored form. Other token kinds delegate to the same writer
+        /// calls <see cref="TemplateWriter"/> would make.
+        /// </remarks>
+        private static void WriteToken(IObjectWriter writer, TemplateToken token)
+        {
+            switch (token?.Type ?? TokenType.Null)
+            {
+                case TokenType.Null:
+                    writer.WriteNull();
+                    break;
+                case TokenType.Boolean:
+                    writer.WriteBoolean(((BooleanToken)token).Value);
+                    break;
+                case TokenType.Number:
+                    writer.WriteNumber(((NumberToken)token).Value);
+                    break;
+                case TokenType.String:
+                    writer.WriteString(token.ToString());
+                    break;
+                case TokenType.BasicExpression:
+                    writer.WriteString(((BasicExpressionToken)token).ToDisplayString());
+                    break;
+                case TokenType.InsertExpression:
+                    writer.WriteString(token.ToString());
+                    break;
+                case TokenType.Mapping:
+                    writer.WriteMappingStart();
+                    foreach (var pair in (MappingToken)token)
+                    {
+                        WriteToken(writer, pair.Key);
+                        WriteToken(writer, pair.Value);
+                    }
+                    writer.WriteMappingEnd();
+                    break;
+                case TokenType.Sequence:
+                    writer.WriteSequenceStart();
+                    foreach (var item in (SequenceToken)token)
+                    {
+                        WriteToken(writer, item);
+                    }
+                    writer.WriteSequenceEnd();
+                    break;
+                default:
+                    throw new NotSupportedException($"Unexpected token type '{token.GetType()}'.");
+            }
         }
     }
 }

@@ -60,12 +60,31 @@ namespace GitHub.Runner.Common.Tests.Worker
         [Trait("Category", "Worker")]
         public void Serialize_PreservesCompositeExpressionInStringToken()
         {
-            // Composite strings like `${{ runner.os }}-primes` are parsed
-            // as a StringToken whose value is exactly that literal. The
-            // adapter must round-trip the literal unchanged.
+            // A StringToken constructed directly with the literal text
+            // round-trips unchanged. (The workflow parser does NOT produce
+            // a StringToken for this input — see
+            // Serialize_ReversesFormatRewriteForCompositeExpression — but
+            // direct StringToken construction must still preserve the
+            // literal verbatim.)
             var token = Str("${{ runner.os }}-primes");
             string yaml = TemplateTokenYamlAdapter.Serialize(token, 0);
             Assert.Contains("${{ runner.os }}-primes", yaml);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void Serialize_ReversesFormatRewriteForCompositeExpression()
+        {
+            // The workflow parser tokenizes a mixed scalar like
+            // `${{ runner.os }}-primes` as a single BasicExpressionToken
+            // whose internal expression is `format('{0}-primes', runner.os)`.
+            // The adapter must surface the author-facing form, not the
+            // parser's normalized rewrite.
+            var token = Expr("format('{0}-primes', runner.os)");
+            string yaml = TemplateTokenYamlAdapter.Serialize(token, 0);
+            Assert.Contains("${{ runner.os }}-primes", yaml);
+            Assert.DoesNotContain("format(", yaml);
         }
 
         [Fact]
