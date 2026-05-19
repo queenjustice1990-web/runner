@@ -57,7 +57,7 @@ namespace GitHub.Runner.Worker.Dap
             {
                 raw = raw.Substring(0, raw.Length - DocEndMarker.Length);
             }
-            return raw.TrimEnd('\n');
+            return raw;
         }
     }
 }

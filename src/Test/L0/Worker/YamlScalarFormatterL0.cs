@@ -27,7 +27,7 @@ namespace GitHub.Runner.Common.Tests.Worker
             catch (Exception ex)
             {
                 throw new Xunit.Sdk.XunitException(
-                    $"Formatted scalar did not round-trip as valid YAML.\nInput: '{value}'\nFormatted: '{scalar}'\nFull YAML:\n{yaml}\nError: {ex.Message}");
+                    $"Formatted scalar did not round-trip as valid YAML.\nInput: '{value}'\nFormatted: '{scalar}'\nFull YAML:\n{yaml}\nError: {ex}");
             }
             Assert.NotNull(doc);
             Assert.True(doc.ContainsKey("k"), $"missing key in parsed doc. Formatted: '{scalar}'");
