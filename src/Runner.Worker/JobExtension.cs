@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Runtime.Serialization;
 using System.Threading;
@@ -901,8 +902,8 @@ namespace GitHub.Runner.Worker
                             foreach (var check in _connectivityCheckTasks)
                             {
                                 var result = await check;
-                                Trace.Info($"Connectivity check result: {result}");
-                                context.Global.JobTelemetry.Add(new JobTelemetry() { Type = JobTelemetryType.ConnectivityCheck, Message = $"{result.EndpointUrl}: {result.StatusCode}" });
+                                Trace.Info($"Connectivity check result: {StringUtil.ConvertToJson(result)}");
+                                context.Global.JobTelemetry.Add(new JobTelemetry() { Type = JobTelemetryType.ConnectivityCheck, Message = $"{StringUtil.ConvertToJson(result)}" });
                             }
                         }
                         catch (Exception ex)
@@ -1014,6 +1015,30 @@ namespace GitHub.Runner.Worker
             {
                 try
                 {
+                    var addresses = await Dns.GetHostAddressesAsync(new Uri(endpointUrl).Host, linkedTokenSource.Token);
+                    stopwatch.Stop();
+                    result.DNSResolutionDurationInMs = (int)stopwatch.ElapsedMilliseconds;
+                    result.EndpointIPs = addresses.Select(a => a.ToString()).ToArray();
+                }
+                catch (Exception ex) when (ex is OperationCanceledException && token.IsCancellationRequested)
+                {
+                    Trace.Error($"DNS resolution canceled: {ex}");
+                    result.StatusCode = "dns_canceled";
+                }
+                catch (Exception ex) when (ex is OperationCanceledException && timeoutTokenSource.IsCancellationRequested)
+                {
+                    Trace.Error($"DNS resolution timeout: {ex}");
+                    result.StatusCode = "dns_timeout";
+                }
+                catch (Exception ex)
+                {
+                    Trace.Error($"Catch exception during DNS resolution: {ex}");
+                    result.StatusCode = $"dns_{ex.Message}";
+                }
+
+                stopwatch.Restart();
+                try
+                {
                     using (var httpClientHandler = HostContext.CreateHttpClientHandler())
                     using (var httpClient = new HttpClient(httpClientHandler))
                     {
@@ -1024,7 +1049,7 @@ namespace GitHub.Runner.Worker
                         }
 
                         var response = await httpClient.GetAsync(endpointUrl, linkedTokenSource.Token);
-                        result.StatusCode = $"{response.StatusCode}";
+                        result.StatusCode = $"http_{response.StatusCode}";
 
                         var githubRequestId = UrlUtil.GetGitHubRequestId(response.Headers);
                         var vssRequestId = UrlUtil.GetVssRequestId(response.Headers);
@@ -1036,26 +1061,26 @@ namespace GitHub.Runner.Worker
                         {
                             result.RequestId = vssRequestId;
                         }
+                        stopwatch.Stop();
+                        result.HttpRequestDurationInMs = (int)stopwatch.ElapsedMilliseconds;
                     }
                 }
                 catch (Exception ex) when (ex is OperationCanceledException && token.IsCancellationRequested)
                 {
                     Trace.Error($"Request canceled during connectivity check: {ex}");
-                    result.StatusCode = "canceled";
+                    result.StatusCode = "http_canceled";
                 }
                 catch (Exception ex) when (ex is OperationCanceledException && timeoutTokenSource.IsCancellationRequested)
                 {
                     Trace.Error($"Request timeout during connectivity check: {ex}");
-                    result.StatusCode = "timeout";
+                    result.StatusCode = "http_timeout";
                 }
                 catch (Exception ex)
                 {
                     Trace.Error($"Catch exception during connectivity check: {ex}");
-                    result.StatusCode = $"{ex.Message}";
+                    result.StatusCode = $"http_{ex.Message}";
                 }
             }
-            stopwatch.Stop();
-            result.DurationInMs = (int)stopwatch.ElapsedMilliseconds;
 
             return result;
         }
@@ -1141,7 +1166,7 @@ namespace GitHub.Runner.Worker
                     try
                     {
                         var result = await CheckConnectivity(endpoint.Value, accessToken: accessToken, timeoutInSeconds: checkConnectivityInfo.RequestTimeoutInSecond, token);
-                        testResult.EndpointsResult[endpoint.Key].Add($"{result.StartTime:s}: {result.StatusCode} - {result.RequestId} - {result.DurationInMs}ms");
+                        testResult.EndpointsResult[endpoint.Key].Add($"{result.StartTime:s}: {result.StatusCode} - {result.RequestId} - {result.HttpRequestDurationInMs}ms");
                         if (!testResult.HasFailure &&
                             result.StatusCode != "OK" &&
                             result.StatusCode != "canceled")
@@ -1212,13 +1237,17 @@ namespace GitHub.Runner.Worker
 
             public string EndpointUrl { get; set; }
 
+            public string[] EndpointIPs { get; set; }
+
             public DateTime StartTime { get; set; }
 
             public string StatusCode { get; set; }
 
             public string RequestId { get; set; }
 
-            public int DurationInMs { get; set; }
+            public int HttpRequestDurationInMs { get; set; }
+
+            public int DNSResolutionDurationInMs { get; set; }
         }
     }
 }
